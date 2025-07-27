@@ -1,0 +1,349 @@
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const nodemailer = require('nodemailer');
+const XLSX = require('xlsx');
+const path = require('path');
+const fs = require('fs').promises;
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware de sécurité
+app.use(helmet());
+app.use(morgan('combined'));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limite à 100 requêtes par fenêtre par IP
+});
+app.use(limiter);
+
+// CORS
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Body parsing
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Configuration multer pour l'upload
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB max
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['.xlsx', '.xls'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowedTypes.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Type de fichier non autorisé. Utilisez .xlsx ou .xls'));
+    }
+  }
+});
+
+// Configuration du transporteur SMTP
+const createTransporter = () => {
+  // Configuration Gmail
+  if (process.env.SMTP_HOST === 'smtp.gmail.com') {
+    return nodemailer.createTransporter({
+      service: 'gmail',
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+  }
+
+  // Configuration SMTP générique
+  return nodemailer.createTransporter({
+    host: process.env.SMTP_HOST,
+    port: process.env.SMTP_PORT,
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+};
+
+// Fonction d'envoi d'email avec pièce jointe
+const sendEmailWithAttachment = async ({ to, subject, text, html, attachmentPath }) => {
+  const transporter = createTransporter();
+
+  const mailOptions = {
+    from: `"Équipe Ratheau" <${process.env.SMTP_USER}>`,
+    to: to,
+    subject: subject,
+    text: text,
+    html: html,
+    attachments: []
+  };
+
+  // Ajouter la pièce jointe si elle existe
+  if (attachmentPath && require('fs').existsSync(attachmentPath)) {
+    mailOptions.attachments.push({
+      filename: 'formulaire_ouverture_compte.pdf',
+      path: attachmentPath,
+      contentType: 'application/pdf'
+    });
+  }
+
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`📧 Email envoyé: ${info.messageId}`);
+    return info;
+  } catch (error) {
+    console.error('❌ Erreur envoi email:', error);
+    throw error;
+  }
+};
+
+// Test de connexion SMTP
+const testConnection = async () => {
+  const transporter = createTransporter();
+  try {
+    await transporter.verify();
+    console.log('✅ Connexion SMTP OK');
+    return true;
+  } catch (error) {
+    console.error('❌ Erreur connexion SMTP:', error);
+    return false;
+  }
+};
+
+// ROUTES
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    message: 'Serveur email opérationnel'
+  });
+});
+
+// Test API
+app.get('/api/email/test', (req, res) => {
+  res.json({ 
+    message: 'API Email fonctionne!', 
+    timestamp: new Date().toISOString(),
+    smtp_configured: !!(process.env.SMTP_USER && process.env.SMTP_PASS)
+  });
+});
+
+// Test connexion SMTP
+app.get('/api/email/test-smtp', async (req, res) => {
+  try {
+    const isConnected = await testConnection();
+    res.json({
+      success: isConnected,
+      message: isConnected ? 'Connexion SMTP OK' : 'Problème de connexion SMTP',
+      config: {
+        host: process.env.SMTP_HOST,
+        port: process.env.SMTP_PORT,
+        user: process.env.SMTP_USER ? process.env.SMTP_USER.substring(0, 3) + '***' : 'Non configuré'
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Upload de fichier Excel
+app.post('/api/email/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Aucun fichier uploadé' });
+    }
+
+    // Lire et parser le fichier Excel
+    const workbook = XLSX.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet);
+
+    // Validation des colonnes requises
+    const requiredColumns = ['ID_Client', 'Nom_Société', 'Nom', 'Prénom', 'Email'];
+    if (data.length > 0) {
+      const columns = Object.keys(data[0]);
+      const missingColumns = requiredColumns.filter(col => !columns.includes(col));
+      
+      if (missingColumns.length > 0) {
+        return res.status(400).json({
+          error: `Colonnes manquantes: ${missingColumns.join(', ')}`
+        });
+      }
+    }
+
+    // Nettoyer le fichier temporaire
+    await fs.unlink(req.file.path);
+
+    res.json({
+      success: true,
+      data: data,
+      message: `${data.length} clients trouvés`
+    });
+
+  } catch (error) {
+    console.error('Erreur upload:', error);
+    res.status(500).json({ error: 'Erreur lors du traitement du fichier' });
+  }
+});
+
+// Envoi d'emails
+app.post('/api/email/send', async (req, res) => {
+  try {
+    const { clients, subject, message, attachmentPath } = req.body;
+
+    // Validation
+    if (!clients || !Array.isArray(clients) || clients.length === 0) {
+      return res.status(400).json({ error: 'Aucun client sélectionné' });
+    }
+
+    if (!subject || subject.trim().length === 0) {
+      return res.status(400).json({ error: 'Sujet requis' });
+    }
+
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ error: 'Message requis' });
+    }
+
+    // Validation des emails
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    for (const client of clients) {
+      if (!client.Email || !emailRegex.test(client.Email)) {
+        return res.status(400).json({ 
+          error: `Email invalide pour ${client.Prénom} ${client.Nom}: ${client.Email}` 
+        });
+      }
+    }
+
+    const results = [];
+    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Envoyer les emails un par un avec délai
+    for (const client of clients) {
+      try {
+        const personalizedMessage = message.replace(
+          /client\(e\)/gi,
+          `${client.Prénom} ${client.Nom}`
+        );
+
+        await sendEmailWithAttachment({
+          to: client.Email,
+          subject: subject,
+          text: personalizedMessage,
+          html: personalizedMessage.replace(/\n/g, '<br>'),
+          attachmentPath: attachmentPath || path.join(__dirname, 'documents/formulaire_ouverture_compte.pdf')
+        });
+
+        results.push({
+          client: client,
+          success: true,
+          timestamp: new Date().toISOString(),
+          message: 'Email envoyé avec succès'
+        });
+
+        console.log(`✅ Email envoyé à ${client.Email}`);
+
+        // Délai entre chaque envoi pour éviter le spam
+        await delay(1000);
+
+      } catch (error) {
+        results.push({
+          client: client,
+          success: false,
+          timestamp: new Date().toISOString(),
+          error: error.message
+        });
+
+        console.error(`❌ Erreur envoi à ${client.Email}:`, error.message);
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    const totalCount = results.length;
+
+    res.json({
+      success: true,
+      results: results,
+      summary: {
+        total: totalCount,
+        success: successCount,
+        failed: totalCount - successCount
+      }
+    });
+
+  } catch (error) {
+    console.error('Erreur globale envoi emails:', error);
+    res.status(500).json({ error: 'Erreur lors de l\'envoi des emails' });
+  }
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route non trouvée' });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('💥 Erreur:', err);
+
+  // Erreur Multer (upload)
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ error: 'Fichier trop volumineux (max 10MB)' });
+  }
+
+  // Erreur générique
+  res.status(500).json({ 
+    error: process.env.NODE_ENV === 'production' 
+      ? 'Erreur interne du serveur' 
+      : err.message 
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+  console.log(`📧 Service email prêt`);
+  console.log(`🔗 API Health: http://localhost:${PORT}/api/health`);
+  console.log(`🧪 Test API: http://localhost:${PORT}/api/email/test`);
+  
+  // Test automatique de la connexion SMTP au démarrage
+  if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+    testConnection().then(success => {
+      if (success) {
+        console.log('✅ SMTP configuré et fonctionnel');
+      } else {
+        console.log('⚠️  SMTP configuré mais connexion échouée - vérifiez vos paramètres');
+      }
+    });
+  } else {
+    console.log('⚠️  SMTP non configuré - éditez le fichier .env');
+  }
+});
+
+module.exports = app;
